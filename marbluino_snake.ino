@@ -25,6 +25,9 @@
 #define MAX_TIMER 30*1000/DELAY
 #define MAX_LENGTH 20
 
+#define ORIENT_X -1
+#define ORIENT_Y 1
+
 #define DEBUG true
 
 U8G2_PCD8544_84X48_F_4W_HW_SPI u8g2(U8G2_R0, DISPLAY_CS_PIN, DISPLAY_DC_PIN, DISPLAY_RS_PIN);
@@ -109,7 +112,7 @@ void getOrientation(float xyz_g[3]) {
   }
 
   // Convert the data to 12-bits
-  int iAccl[3];
+  signed short iAccl[3];
   for (int i = 0; i < 3; i++) {
     iAccl[i] = ((data[i*2+1] << 8) | data[i*2+2]) >> 4;
     if (iAccl[i] > 2047)
@@ -237,7 +240,7 @@ bool checkIfGotTheApple(upoint_t newPos) {
 
 void getDir(float xyz_g[3]) {
   uint8_t newDir = xyz_g[0] > 0 ? 2 : 0;
-  if (abs(xyz_g[1]) > abs(xyz_g[0])) {
+  if (fabs(xyz_g[1]) > fabs(xyz_g[0])) {
     newDir = xyz_g[1] > 0 ? 1 : 3;
   }
   if (abs(dir - newDir) % 2 == 1)
@@ -254,20 +257,20 @@ upoint_t getNewPos(void) {
 
   switch(dir) {
     case 0:
-      newPos.x = lastPos.x >= max_x ? 0 : lastPos.x + 1;
+      newPos.x = lastPos.x >= max_x ? 0 : lastPos.x + ORIENT_X;
       newPos.y = lastPos.y;
       break;
     case 1:
       newPos.x = lastPos.x;
-      newPos.y = lastPos.y >= max_y ? 0 : lastPos.y + 1;
+      newPos.y = lastPos.y >= max_y ? 0 : lastPos.y + ORIENT_Y;
       break;
     case 2:
-      newPos.x = lastPos.x > 0 ? lastPos.x - 1 : max_x;
+      newPos.x = lastPos.x > 0 ? lastPos.x - ORIENT_X : max_x;
       newPos.y = lastPos.y;
       break;
     case 3:
       newPos.x = lastPos.x;
-      newPos.y = lastPos.y > 0 ? lastPos.y - 1 : max_y;
+      newPos.y = lastPos.y > 0 ? lastPos.y - ORIENT_Y : max_y;
       break;
   }
   return newPos;
