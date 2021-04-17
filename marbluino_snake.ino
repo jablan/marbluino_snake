@@ -1,6 +1,10 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <WiredDevice.h>
+#include <RegisterBasedWiredDevice.h>
+#include <Accelerometer.h>
+#include <AccelerometerMMA8451.h>
 
 #ifdef ESP8266
 #include <ESP8266WiFi.h>
@@ -23,21 +27,37 @@
 #define BALLSIZE 3
 #define DELAY 150
 #define MAX_TIMER 30*1000/DELAY
-#define MAX_LENGTH 20
+#define MAX_LENGTH 100
+#define LEN_PER_LEVEL 3
 
-#define ORIENT_X -1
-#define ORIENT_Y 1
+/**
+ * Depending on how the sensor is oriented in relation to the display, we need to adjust sensor readings.
+ * Uncomment only one of ORN_X_ and ORN_Y_ so that the X and Y are read from correct sensor direction:
+ */
+//#define ORN_X_FROM_X
+#define ORN_X_FROM_Y
+//#define ORN_X_FROM_Z
+#define ORN_Y_FROM_X
+//#define ORN_Y_FROM_Y
+//#define ORN_Y_FROM_Z
+/**
+ * Depending on how the sensor is oriented, the reading needs to be inverted or not. Uncomment if any of
+ * X or Y reading needs to be inverted:
+ */
+//#define ORN_X_INV
+//#define ORN_Y_INV
 
 #define DEBUG true
 
 U8G2_PCD8544_84X48_F_4W_HW_SPI u8g2(U8G2_R0, DISPLAY_CS_PIN, DISPLAY_DC_PIN, DISPLAY_RS_PIN);
+AccelerometerMMA8451 acc(0);
 
 typedef struct {
   uint8_t x;
   uint8_t y;
 } upoint_t;
 
-uint8_t displayWidth, displayHeight, max_x, max_y, points, timer = MAX_TIMER;
+uint8_t displayWidth, displayHeight, max_x, max_y, level, timer = MAX_TIMER;
 upoint_t snake[MAX_LENGTH];
 uint8_t headIndex = 0;
 uint8_t snakeLen = 1;
@@ -50,97 +70,88 @@ uint16_t tonesSad[][2] = {{262, 1}, {247, 1}, {233, 1}, {220, 3}, {0, 0}};
 uint8_t melodyIndex;
 uint16_t (*currentMelody)[2];
 
-// MMA8452Q I2C address is 0x1C(28)
-#define MMA_ADDR 0x1C
+void startMotionDetection() {
+  acc.standby();
+  acc.setMotionDetection(false, true, 0x03);
+  acc.setMotionDetectionThreshold(false, 0x1a);
+  acc.setMotionDetectionCount(0x10);
 
-void mmaRegWrite(byte reg, byte value) {
-  Wire.beginTransmission(MMA_ADDR);
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission();
+  // Register 0x2D, Control Register 4 configures all embedded features for interrupt detection.
+  // To set this device up to run an interrupt service routine:
+  // Program the Pulse Detection bit in Control Register 4.
+  // Set bit 3 to enable the pulse detection "INT_PULSE".
+  acc.enableInterrupt(AccelerometerMMA8451::INT_FF_MT);
+
+  // Register 0x2E is Control Register 5 which gives the option of routing the interrupt to either INT1 or INT2
+  acc.routeInterruptToInt1(AccelerometerMMA8451::INT_FF_MT);
+
+  // Put the device in Active Mode
+  acc.activate();
 }
 
-void mmaSetStandbyMode() {
-  mmaRegWrite(0x2A, 0x18); //Set the device in 100 Hz ODR, Standby  
-}
+void startTransientDetection() {  
+  // Put the part into Standby Mode
+  acc.standby();
 
-void mmaSetActiveMode() {
-  mmaRegWrite(0x2A, 0x19);  
-}
+  // This will enable the transient detection.
+  acc.setTransientDetection(true, 0x03, 0x00);
 
-// Causes interrupt when shaken
-void mmaSetupMotionDetection() {
-  // https://www.nxp.com/docs/en/application-note/AN4070.pdf
-  mmaSetStandbyMode();
-  mmaRegWrite(0x15, 0x78);
-  mmaRegWrite(0x17, 0x1a);
-  mmaRegWrite(0x18, 0x10);
-  // enable interrupt
-  mmaRegWrite(0x2D, 0x04);
-  mmaRegWrite(0x2E, 0x04);
-  mmaSetActiveMode();
-}
+  // Set the transient threshold.
+  acc.setTransientThreshold(true, 0x60);
 
-void mmaDisableInterrupt() {
-  mmaRegWrite(0x2d, 0x00);
+  // Set the debounce counter
+  acc.setTransientCount(0x02);
+
+//  // Configure the INT pins for Open Drain
+//  acc.setPushPullOpenDrain(AccelerometerMMA8451::PUSH_PULL);
+//
+//  // Configure the INT pins for Active Low
+//  acc.setInterruptPolarity(AccelerometerMMA8451::ACTIVE_LOW);
+
+  // Register 0x2D, Control Register 4 configures all embedded features for interrupt detection.
+  // To set this device up to run an interrupt service routine: 
+  // Program the Transient Detection bit in Control Register 4. 
+  // Set bit 5 to enable the transient detection "INT_TRANS".
+  acc.enableInterrupt(AccelerometerMMA8451::INT_TRANS);
+
+  // Register 0x2E is Control Register 5 which gives the option of routing the interrupt to either INT1 or INT2
+  acc.routeInterruptToInt1(AccelerometerMMA8451::INT_TRANS);
+
+  // Put the device in Active Mode
+  acc.activate();
 }
 
 void setupMMA()
 {
-  // Initialise I2C communication as MASTER
-  Wire.begin();
-
-  mmaSetStandbyMode();
-  mmaDisableInterrupt();
-  mmaRegWrite(0x0e, 0x00); // set range to +/- 2G
-  mmaSetActiveMode();
-}
-
-void getOrientation(float xyz_g[3]) {
-  unsigned int data[7];
-
-  // Request 7 bytes of data
-  Wire.requestFrom(MMA_ADDR, 7);
- 
-  // Read 7 bytes of data
-  // status, xAccl lsb, xAccl msb, yAccl lsb, yAccl msb, zAccl lsb, zAccl msb
-  if(Wire.available() == 7) 
-  {
-    for (int i = 0; i<6; i++) {
-      data[i] = Wire.read();
-    }
-  }
-
-  // Convert the data to 12-bits
-  signed short iAccl[3];
-  for (int i = 0; i < 3; i++) {
-    iAccl[i] = ((data[i*2+1] << 8) | data[i*2+2]) >> 4;
-    if (iAccl[i] > 2047)
-    {
-      iAccl[i] -= 4096;
-    }
-    xyz_g[i] = (float)iAccl[i] / 1024;
-  }
+  // Put the part into Standby Mode
+  acc.standby();
+  acc.disableInterrupt(AccelerometerMMA8451::INT_ALL);
+  acc.setDynamicRange(AccelerometerMMA8451::DR_2G);
+  // Set the data rate to 50 Hz (for example, but can choose any sample rate).
+  acc.setOutputDataRate(AccelerometerMMA8451::ODR_50HZ_20_MS);
+  // Put the device in Active Mode
+  acc.activate();
 }
 
 void drawBoard(void) {
   static char buf[12];
   u8g2.clearBuffer();
-  // draw marble
+  // draw snake, head to tail
   uint8_t currentIndex = headIndex;
   for (int i = 0; i < snakeLen; i++) {
-    u8g2.drawBox(snake[currentIndex].x * BALLSIZE - BALLSIZE / 2, snake[currentIndex].y * BALLSIZE - BALLSIZE / 2, BALLSIZE, BALLSIZE);
+    u8g2.drawBox(snake[currentIndex].x * BALLSIZE, snake[currentIndex].y * BALLSIZE, BALLSIZE, BALLSIZE);
     if (currentIndex == 0) currentIndex = MAX_LENGTH;
     currentIndex--;
   }
-  u8g2.drawCircle(flag.x * BALLSIZE, flag.y * BALLSIZE, BALLSIZE/2);
+  // draw fruit
+  u8g2.drawCircle(flag.x * BALLSIZE + BALLSIZE / 2, flag.y * BALLSIZE + BALLSIZE / 2, BALLSIZE/2);
   
   // write points and time
-  itoa(points, buf, 10);
+  itoa(level, buf, 10);
   u8g2.drawStr(0, 5, buf);
   itoa(timer/10, buf, 10);
   uint8_t width = u8g2.getStrWidth(buf);
-  u8g2.drawStr(max_x-width, 5, buf);
+  u8g2.drawStr(displayWidth - width, 5, buf);
   u8g2.sendBuffer();
 }
 
@@ -155,11 +166,8 @@ void showPopup(char *line_1, char *line_2) {
 }
 
 void placeRandomly(upoint_t *point) {
-//  do {
-    (*point).x = random(max_x - 2*BALLSIZE) + BALLSIZE;
-    (*point).y = random(max_y - 2*BALLSIZE) + BALLSIZE;
-  // ensure not spawning too close to the ball
-//  } while (abs((*point).x-ball.x) + abs((*point).y-ball.y) < MIN_DISTANCE);
+  (*point).x = random(max_x - 2*BALLSIZE) + BALLSIZE;
+  (*point).y = random(max_y - 2*BALLSIZE) + BALLSIZE;
 }
 
 // used to play the melody asynchronously while the user is playing
@@ -205,7 +213,7 @@ void melodyLevel(void) {
 }
 
 void initGame(void) {
-  points = 0;
+  level = 1;
   snakeLen = 1;
   headIndex = 0;
   timer = MAX_TIMER;
@@ -216,7 +224,7 @@ void initGame(void) {
 
 void gameOver(void) {
   char msg[50];
-  sprintf(msg, "score: %d", points);
+  sprintf(msg, "score: %d", level);
   showPopup("GAME OVER", msg);
   melodySad();
   initGame();
@@ -238,39 +246,61 @@ bool checkIfGotTheApple(upoint_t newPos) {
   return false;
 }
 
-void getDir(float xyz_g[3]) {
-  uint8_t newDir = xyz_g[0] > 0 ? 2 : 0;
-  if (fabs(xyz_g[1]) > fabs(xyz_g[0])) {
-    newDir = xyz_g[1] > 0 ? 1 : 3;
+void getDir() {
+  #ifdef ORN_X_FROM_X
+  float xg = acc.readXg();
+  #endif
+  #ifdef ORN_X_FROM_Y
+  float xg = acc.readYg();
+  #endif
+  #ifdef ORN_X_FROM_Z
+  float xg = acc.readZg();
+  #endif
+  #ifdef ORN_Y_FROM_X
+  float yg = acc.readXg();
+  #endif
+  #ifdef ORN_Y_FROM_Y
+  float yg = acc.readYg();
+  #endif
+  #ifdef ORN_Y_FROM_Z
+  float yg = acc.readZg();
+  #endif
+  #ifdef ORN_X_INV
+  xg = -xg;
+  #endif
+  #ifdef ORN_Y_INV
+  yg = -yg;
+  #endif
+
+  uint8_t newDir = xg > 0 ? 2 : 0;
+  if (fabs(yg) > fabs(xg)) {
+    newDir = yg > 0 ? 1 : 3;
   }
   if (abs(dir - newDir) % 2 == 1)
     dir = newDir;
 }
 
 upoint_t getNewPos(void) {
-  float xyz_g[3];
-  getOrientation(xyz_g);
-
   upoint_t newPos;
-  getDir(xyz_g);
+  getDir();
   upoint_t lastPos = snake[headIndex];
 
   switch(dir) {
     case 0:
-      newPos.x = lastPos.x >= max_x ? 0 : lastPos.x + ORIENT_X;
+      newPos.x = lastPos.x >= max_x ? 0 : lastPos.x + 1;
       newPos.y = lastPos.y;
       break;
     case 1:
       newPos.x = lastPos.x;
-      newPos.y = lastPos.y >= max_y ? 0 : lastPos.y + ORIENT_Y;
+      newPos.y = lastPos.y >= max_y ? 0 : lastPos.y + 1;
       break;
     case 2:
-      newPos.x = lastPos.x > 0 ? lastPos.x - ORIENT_X : max_x;
+      newPos.x = lastPos.x > 0 ? lastPos.x - 1 : max_x;
       newPos.y = lastPos.y;
       break;
     case 3:
       newPos.x = lastPos.x;
-      newPos.y = lastPos.y > 0 ? lastPos.y - ORIENT_Y : max_y;
+      newPos.y = lastPos.y > 0 ? lastPos.y - 1 : max_y;
       break;
   }
   return newPos;
@@ -278,12 +308,13 @@ upoint_t getNewPos(void) {
 
 void goToSleep() {
   showPopup("SLEEPING...", "shake to wake");
-  mmaSetupMotionDetection();
+  startMotionDetection();
+  delay(1000);
 #ifdef ESP8266
   ESP.deepSleep(0);
 #endif
 #ifdef __AVR__
-LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
+  LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
 #endif
 }
 
@@ -291,19 +322,22 @@ void setup(void) {
   randomSeed(analogRead(0));
 #ifdef DEBUG
   Serial.begin(115200);
+  Serial.println("Marbluino Snake");
 #endif
 #ifdef ESP8266
   WiFi.mode(WIFI_OFF);
 #endif
   
   setupMMA();
- 
+
+  Serial.println("MMA set up!");
+
   u8g2.begin();
   u8g2.setFont(u8g2_font_baby_tf);
   displayWidth = u8g2.getDisplayWidth();
   displayHeight = u8g2.getDisplayHeight();
-  max_x = displayWidth / BALLSIZE;
-  max_y = displayHeight / BALLSIZE;
+  max_x = displayWidth / BALLSIZE - 1;
+  max_y = displayHeight / BALLSIZE - 1;
   initGame();
 }
 
@@ -315,13 +349,13 @@ void loop(void) {
     melodyFlag();
     if (snakeLen < MAX_LENGTH) {
       placeRandomly(&flag);
-      snakeLen++;
-      points++;
+      level++;
       timer = MAX_TIMER;
     } else {
       gameOver();
     }
   }
+  if (snakeLen < level * LEN_PER_LEVEL) snakeLen++;
   headIndex++;
   if (headIndex >= MAX_LENGTH) {
     headIndex = 0;
@@ -335,7 +369,7 @@ void loop(void) {
     timer--;
   }
   else {
-    if (points == 0) {
+    if (level <= 1) {
       goToSleep();    
     } else {
       gameOver();
