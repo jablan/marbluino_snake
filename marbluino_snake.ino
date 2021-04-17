@@ -89,38 +89,6 @@ void startMotionDetection() {
   acc.activate();
 }
 
-void startTransientDetection() {  
-  // Put the part into Standby Mode
-  acc.standby();
-
-  // This will enable the transient detection.
-  acc.setTransientDetection(true, 0x03, 0x00);
-
-  // Set the transient threshold.
-  acc.setTransientThreshold(true, 0x60);
-
-  // Set the debounce counter
-  acc.setTransientCount(0x02);
-
-//  // Configure the INT pins for Open Drain
-//  acc.setPushPullOpenDrain(AccelerometerMMA8451::PUSH_PULL);
-//
-//  // Configure the INT pins for Active Low
-//  acc.setInterruptPolarity(AccelerometerMMA8451::ACTIVE_LOW);
-
-  // Register 0x2D, Control Register 4 configures all embedded features for interrupt detection.
-  // To set this device up to run an interrupt service routine: 
-  // Program the Transient Detection bit in Control Register 4. 
-  // Set bit 5 to enable the transient detection "INT_TRANS".
-  acc.enableInterrupt(AccelerometerMMA8451::INT_TRANS);
-
-  // Register 0x2E is Control Register 5 which gives the option of routing the interrupt to either INT1 or INT2
-  acc.routeInterruptToInt1(AccelerometerMMA8451::INT_TRANS);
-
-  // Put the device in Active Mode
-  acc.activate();
-}
-
 void setupMMA()
 {
   // Put the part into Standby Mode
